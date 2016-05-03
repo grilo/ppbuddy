@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
-import plistlib
+ 
+import sys
 import os
 import tempfile
 import datetime
@@ -10,8 +10,11 @@ import subprocess
 import shlex
 import logging
 import argparse
-
-
+import plistlib
+import re
+import hashlib
+ 
+ 
 def colorize(color, string):
     colors = {
         'header': '\033[95m',
@@ -24,11 +27,11 @@ def colorize(color, string):
         'underline': '\033[4m',
     }
     return "%s%s%s" % (colors[color], string, colors['endcolor'])
-
+ 
 def check_expiration(date):
     color = 'green'
     warning_threshold = 1296000 # 2 weeks
-    critical_threshold = 64800000 # 1 week
+    critical_threshold = 648000 # 1 week
     delta = date - time.time()
     s = ''
     if  delta < critical_threshold:
@@ -39,14 +42,14 @@ def check_expiration(date):
         color = 'warning'
     s += (colorize(color, time.ctime(date)))
     return s
-
+ 
 def cert_decoder(cert_string):
     with tempfile.NamedTemporaryFile() as temp:
         temp.write(cert_string)
         temp.flush()
         command = 'openssl x509 -inform der -text -in %s' % (temp.name)
-        return subprocess.check_output(shlex.split(command))
-
+        return subprocess.check_output(shlex.split(command)).decode("unicode_escape").encode("latin1")
+ 
 def pp_loader(pp_path):
     with open(pp_path, 'rb') as provision_file:
         provision_data = provision_file.read()
@@ -56,13 +59,25 @@ def pp_loader(pp_path):
         stop_index = provision_data.index(stop_tag, start_index + len(start_tag)) + len(stop_tag)
         plist_data = provision_data[start_index:stop_index]
         return plistlib.readPlistFromString(plist_data)
+ 
+def parse_dn(string_dn):
+    attrs = {}
+    curr = ""
+    for match in re.split("([A-Z]+)=", string_dn):
+        match = match.strip()
+        if re.match("^[A-Z]+$", match):
+            curr = match
+        else:
+            attrs[curr] = match.rstrip(",")
+    return attrs
 
+ 
 class Cert(object):
-
-    def __init__(self, cert_string):
+ 
+    def __init__(self, shasum, cert_string):
+        self.shasum = shasum.upper()
         self.validity, self.uid, self.cn = self._parse_cert(cert_string)
-        self.cn = self.cn.decode("unicode_escape").encode("latin1")
-
+ 
     def _parse_cert(self, cert):
         validity, uid, cn = None, None, None
         for l in cert.splitlines():
@@ -70,15 +85,13 @@ class Cert(object):
                 d = l.split(":", 1)[-1].lstrip()
                 validity = time.mktime(datetime.datetime.strptime(d, '%b %d %H:%M:%S %Y %Z').timetuple())
             elif "Subject: UID=" in l:
-                subject = l.split(":", 1)[-1].split(", ")
-                uid, cn = subject[0].split("=")[1], subject[1].split("=")[1]
+                attrs = parse_dn(l)
+                uid = attrs['UID']
+                cn = attrs['CN']
         return validity, uid, cn
-
-    def __repr__(self):
-        return self.uid + " " + self.cn
-
+ 
 class MobileProvision(object):
-
+ 
     def __init__(self, pp_dict, cert_decoder):
         self.uuid = pp_dict['UUID']
         self.name = pp_dict['Name']
@@ -97,20 +110,20 @@ class MobileProvision(object):
         self.certs = []
         self.certs_expired = []
         for c in pp_dict['DeveloperCertificates']:
-            cert = Cert(cert_decoder(c.data))
+            shasum = hashlib.sha1(c.data).hexdigest()
+            cert = Cert(shasum, cert_decoder(c.data))
             if cert.validity <= time.time():
                 logging.debug("%s: Old certificate found." % (self.uuid))
                 self.certs_expired.append(cert)
             else:
                 logging.debug("%s: Up-to-date certificate found." % (self.uuid))
                 self.certs.append(cert)
-
-
+ 
 if __name__ == '__main__':
-
+ 
     desc = 'Lookup all the installed provisioning profiles and output information about them.'
     parser = argparse.ArgumentParser(description=desc)
-
+ 
     parser.add_argument("-v", "--verbose", action="store_true", \
         help="Increase output verbosity")
     parser.add_argument("-a", "--appid", default=None, type=str, \
@@ -125,22 +138,26 @@ if __name__ == '__main__':
         help="The directory to look for installed provisioning profiles.")
     parser.add_argument("-r", "--report", action="store_true", \
         help="Generate a nice looking report instead of generating output for an application.")
-
+ 
     args = parser.parse_args()
-
+ 
     logging.basicConfig(format='%(asctime)s::%(levelname)s::%(message)s')
     logging.getLogger().setLevel(getattr(logging, 'INFO'))
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    if not os.path.isdir(args.mobiledevices):
+        logging.critical("The directory that should contain provisioning profiles doesn't exist! (%s)" % (args.mobiledevices))
+        sys.exit(1)
+ 
     provisioning_profiles = []
     for profile in os.listdir(args.mobiledevices):
         pp_fullpath = os.path.join(args.mobiledevices, profile)
         if not os.path.isfile(pp_fullpath): continue
         elif not profile.endswith("mobileprovision"): continue
-
+ 
         p = MobileProvision(pp_loader(pp_fullpath), cert_decoder)
-
+ 
         # When in report mode, just show the info
         if args.report:
             print colorize('blue', '------------------------------------------')
@@ -155,36 +172,35 @@ if __name__ == '__main__':
                 print "\t%s %s" % (c.cn, check_expiration(c.validity))
             for c in p.certs_expired:
                 print "\t%s %s" % (c.cn, check_expiration(c.validity))
-            #for d in p.udids:
-            #    print "\n\t%s" % (d)
             continue
-
-        if args.appid and args.appid != p.appid:
-            logging.debug("%s: Doesn't match specified appid (%s)" % (p.uuid, p.appid))
-            continue
-
-        if args.production and p.development:
-            logging.warning("%s: Doesn't match environment (%s)" % (p.uuid, "pro"))
-            continue
-        elif not args.production and p.development == False:
-            logging.warning("%s: Doesn't match environment (%s)" % (p.uuid, "dev"))
-            continue
-
+ 
+        if p.appid != '*':
+            if args.appid and args.appid != p.appid:
+                logging.debug("%s: Doesn't match specified appid (%s)" % (p.uuid, p.appid))
+                continue
+ 
+            if args.production and p.development:
+                logging.warning("%s: Doesn't match environment (%s)" % (p.uuid, "pro"))
+                continue
+            elif not args.production and p.development == False:
+                logging.warning("%s: Doesn't match environment (%s)" % (p.uuid, "dev"))
+                continue
+ 
         if not p.certs:
             logging.warning("%s: No valid certificates found" % (p.uuid))
             continue
-
+ 
         if args.identities:
             for c in p.certs:
-                if c.cn in args.identities:
+                if c.cn in args.identities and c.shasum.upper() in args.identities.upper():
                     provisioning_profiles.append(p)
                     break
                 else:
                     logging.error("%s: Looks good, but no certificates match the codesigning identities available within the keychain." % (p.uuid))
         else:
             provisioning_profiles.append(p)
-
+ 
     # Make sure the wildcard provisioning profiles come last
     for p in sorted(provisioning_profiles, key=lambda x: x.appid, reverse=args.wildcard):
         for c in p.certs:
-            print '@'.join([p.uuid, p.name, c.cn])
+            print '@'.join([p.uuid, p.name, c.shasum])
