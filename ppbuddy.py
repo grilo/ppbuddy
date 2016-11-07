@@ -27,6 +27,24 @@ def colorize(color, string):
     }
     return "%s%s%s" % (colors[color], string, colors['endcolor'])
 
+def pretty_print(p):
+    print colorize('blue', '------------------------------------------')
+    print "Name: %s" % (p.name)
+    print "AppId: %s" % (p.appid)
+    print "UUID: %s" % (p.uuid)
+    print "Development?: %s" % (p.development)
+    print "PushNotifications?: %s" % (p.pushnotifications)
+    print "Expiration: %s" % (check_expiration(p.expiration_date))
+    print "Attached Certificates:"
+    for c in p.certs:
+        print "\t%s %s" % (c.cn, check_expiration(c.validity))
+    for c in p.certs_expired:
+        print "\t%s %s" % (c.cn, check_expiration(c.validity))
+
+def get_codesign_identities(keychain):
+    command = '/usr/bin/security find-identity -p codesigning -v %s' % (keychain)
+    return subprocess.check_output(shlex.split(command)).decode("unicode_escape").encode("latin1")
+
 def check_expiration(date):
     color = 'green'
     warning_threshold = 1296000 # 2 weeks
@@ -42,33 +60,6 @@ def check_expiration(date):
     s += (colorize(color, time.ctime(date)))
     return s
 
-def cert_decoder(cert_string):
-    with tempfile.NamedTemporaryFile() as temp:
-        temp.write(cert_string)
-        temp.flush()
-        command = 'openssl x509 -inform der -text -in %s' % (temp.name)
-        return subprocess.check_output(shlex.split(command)).decode("unicode_escape").encode("latin1")
-
-def pp_loader(pp_path):
-    with open(pp_path, 'rb') as provision_file:
-        provision_data = provision_file.read()
-        start_tag = '<?xml version="1.0" encoding="UTF-8"?>'
-        stop_tag = '</plist>'
-        start_index = provision_data.index(start_tag)
-        stop_index = provision_data.index(stop_tag, start_index + len(start_tag)) + len(stop_tag)
-        plist_data = provision_data[start_index:stop_index]
-        return plistlib.readPlistFromString(plist_data)
-
-def parse_dn(string_dn):
-    attrs = {}
-    curr = ""
-    for match in re.split("([A-Z]+)=", string_dn):
-        match = match.strip()
-        if re.match("^[A-Z]+$", match):
-            curr = match
-        else:
-            attrs[curr] = match.rstrip(",")
-    return attrs
 
 class Cert(object):
 
@@ -83,14 +74,27 @@ class Cert(object):
                 d = l.split(":", 1)[-1].lstrip()
                 validity = time.mktime(datetime.datetime.strptime(d, '%b %d %H:%M:%S %Y %Z').timetuple())
             elif "Subject: UID=" in l:
-                attrs = parse_dn(l)
+                attrs = self.parse_dn(l)
                 uid = attrs['UID']
                 cn = attrs['CN']
         return validity, uid, cn
 
+    def parse_dn(self, string_dn):
+        attrs = {}
+        curr = ""
+        for match in re.split("([A-Z]+)=", string_dn):
+            match = match.strip()
+            if re.match("^[A-Z]+$", match):
+                curr = match
+            else:
+                attrs[curr] = match.rstrip(",")
+        return attrs
+
+
 class MobileProvision(object):
 
-    def __init__(self, pp_dict, cert_decoder):
+    def __init__(self, pp_fullpath, cert_decoder):
+        pp_dict = self.pp_loader(pp_fullpath)
         self.uuid = pp_dict['UUID']
         self.name = pp_dict['Name']
         self.teamid = pp_dict['TeamIdentifier'][0]
@@ -110,13 +114,32 @@ class MobileProvision(object):
         self.certs_expired = []
         for c in pp_dict['DeveloperCertificates']:
             shasum = hashlib.sha1(c.data).hexdigest()
-            cert = Cert(shasum, cert_decoder(c.data))
+            cert = Cert(shasum, self.cert_decoder(c.data))
             if cert.validity <= time.time():
                 logging.debug("%s: Old certificate found." % (self.uuid))
                 self.certs_expired.append(cert)
             else:
                 logging.debug("%s: Up-to-date certificate found." % (self.uuid))
                 self.certs.append(cert)
+
+    def pp_loader(self, pp_path):
+        with open(pp_path, 'rb') as provision_file:
+            provision_data = provision_file.read()
+            start_tag = '<?xml version="1.0" encoding="UTF-8"?>'
+            stop_tag = '</plist>'
+            start_index = provision_data.index(start_tag)
+            stop_index = provision_data.index(stop_tag, start_index + len(start_tag)) + len(stop_tag)
+            plist_data = provision_data[start_index:stop_index]
+            return plistlib.readPlistFromString(plist_data)
+
+
+    def cert_decoder(self, cert_string):
+        with tempfile.NamedTemporaryFile() as temp:
+            temp.write(cert_string)
+            temp.flush()
+            command = 'openssl x509 -inform der -text -in %s' % (temp.name)
+            return subprocess.check_output(shlex.split(command)).decode("unicode_escape").encode("latin1")
+
 
 if __name__ == '__main__':
 
@@ -131,8 +154,8 @@ if __name__ == '__main__':
         help="Wether wildcard provisioning profiles should be prioritized when determining the best profile.")
     parser.add_argument("-p", "--production", action="store_true", \
         help="Look for development certificates only (as opposed to production certificates).")
-    parser.add_argument("-i", "--identities", type=str, \
-        help="The output of the /usr/bin/security find-identity -p codesigning -v <keychain> command. Improves the profile matching heuristic")
+    parser.add_argument("-k", "--keychain", type=str, \
+        help="The path of the keychain (must be unlocked prior with 'security unlock-keychain'). Improves the profile matching heuristic.")
     parser.add_argument("-m", "--mobiledevices", type=str, default=os.path.join(os.path.expanduser('~'), "Library", "MobileDevice", "Provisioning Profiles"), \
         help="The directory to look for installed provisioning profiles.")
     parser.add_argument("-r", "--report", action="store_true", \
@@ -145,28 +168,27 @@ if __name__ == '__main__':
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+
+    identities = None
+    if args.keychain:
+        if not os.path.isfile(args.keychain):
+            raise SystemExit('Unable find keychain file: %s' % (args.keychain))
+        identities = get_codesign_identities(args.keychain)
+
+    if not os.path.isdir(args.mobiledevices):
+        raise SystemExit('Unable to find directory containing provisioning profiles: %s' % (args.mobiledevices))
+
     provisioning_profiles = []
     for profile in os.listdir(args.mobiledevices):
         pp_fullpath = os.path.join(args.mobiledevices, profile)
         if not os.path.isfile(pp_fullpath): continue
         elif not profile.endswith("mobileprovision"): continue
 
-        p = MobileProvision(pp_loader(pp_fullpath), cert_decoder)
+        p = MobileProvision(pp_fullpath)
 
         # When in report mode, just show the info
         if args.report:
-            print colorize('blue', '------------------------------------------')
-            print "Name: %s" % (p.name)
-            print "AppId: %s" % (p.appid)
-            print "UUID: %s" % (p.uuid)
-            print "Development?: %s" % (p.development)
-            print "PushNotifications?: %s" % (p.pushnotifications)
-            print "Expiration: %s" % (check_expiration(p.expiration_date))
-            print "Attached Certificates:"
-            for c in p.certs:
-                print "\t%s %s" % (c.cn, check_expiration(c.validity))
-            for c in p.certs_expired:
-                print "\t%s %s" % (c.cn, check_expiration(c.validity))
+            pretty_print(p)
             continue
 
         if p.appid != '*':
@@ -185,9 +207,9 @@ if __name__ == '__main__':
             logging.warning("%s: No valid certificates found" % (p.uuid))
             continue
 
-        if args.identities:
+        if identities:
             for c in p.certs:
-                if c.cn in args.identities and c.shasum.upper() in args.identities.upper():
+                if c.cn in identities and c.shasum.upper() in identities.upper():
                     provisioning_profiles.append(p)
                     break
                 else:
