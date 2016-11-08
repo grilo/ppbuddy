@@ -11,8 +11,9 @@ import shlex
 import logging
 import argparse
 import re
-
+import json
 import hashlib
+import sys
 
 def colorize(color, string):
     colors = {
@@ -27,54 +28,72 @@ def colorize(color, string):
     }
     return "%s%s%s" % (colors[color], string, colors['endcolor'])
 
-def pretty_print(p):
+def pretty_print(pprofile):
     print colorize('blue', '------------------------------------------')
-    print "Name: %s" % (p.name)
-    print "AppId: %s" % (p.appid)
-    print "UUID: %s" % (p.uuid)
-    print "Development?: %s" % (p.development)
-    print "PushNotifications?: %s" % (p.pushnotifications)
-    print "Expiration: %s" % (check_expiration(p.expiration_date))
+    print "Name: %s" % (pprofile.name)
+    print "AppId: %s" % (pprofile.appid)
+    print "UUID: %s" % (pprofile.uuid)
+    print "Development?: %s" % (pprofile.development)
+    print "PushNotifications?: %s" % (pprofile.pushnotifications)
+    print "Expiration: %s" % (check_expiration(pprofile.expiration_date))
     print "Attached Certificates:"
-    for c in p.certs:
-        print "\t%s %s" % (c.cn, check_expiration(c.validity))
-    for c in p.certs_expired:
-        print "\t%s %s" % (c.cn, check_expiration(c.validity))
+    for cert in pprofile.certs:
+        print "\t%s %s" % (cert.cn, check_expiration(cert.validity))
+    for cert in pprofile.certs_expired:
+        print "\t%s %s" % (cert.cn, check_expiration(cert.validity))
+
+def get_profiles(pp_dir=os.path.join(
+        os.path.expanduser('~'),
+        "Library",
+        "MobileDevice",
+        "Provisioning Profiles"
+    )):
+    profiles = []
+    for profile in os.listdir(pp_dir):
+        pp_fullpath = os.path.join(pp_dir, profile)
+        if not pp_fullpath.endswith("mobileprovision"):
+            continue
+        profiles.append(MobileProvision(pp_fullpath))
+    return profiles
+
+def run_cmd(cmd):
+    return subprocess.check_output(shlex.split(cmd)).decode("unicode_escape").encode("latin1")
 
 def get_codesign_identities(keychain):
     command = '/usr/bin/security find-identity -p codesigning -v %s' % (keychain)
-    return subprocess.check_output(shlex.split(command)).decode("unicode_escape").encode("latin1")
+    return run_cmd(command)
 
 def check_expiration(date):
     color = 'green'
     warning_threshold = 1296000 # 2 weeks
     critical_threshold = 648000 # 1 week
     delta = date - time.time()
-    s = ''
+    time_string = ''
     if  delta < critical_threshold:
         logging.critical("Expiration date is very close!")
         color = 'fail'
     elif delta < warning_threshold:
         logging.warning("Expiration date is coming soon...")
         color = 'warning'
-    s += (colorize(color, time.ctime(date)))
-    return s
+    time_string += (colorize(color, time.ctime(date)))
+    return time_string
 
 
 class Cert(object):
 
     def __init__(self, shasum, cert_string):
         self.shasum = shasum.upper()
-        self.validity, self.uid, self.cn = self._parse_cert(cert_string)
+        self.validity, self.uid, self.cn = self.parse_cert(cert_string)
 
-    def _parse_cert(self, cert):
+    def parse_cert(self, cert):
         validity, uid, cn = None, None, None
-        for l in cert.splitlines():
-            if "Not After : " in l:
-                d = l.split(":", 1)[-1].lstrip()
-                validity = time.mktime(datetime.datetime.strptime(d, '%b %d %H:%M:%S %Y %Z').timetuple())
-            elif "Subject: UID=" in l:
-                attrs = self.parse_dn(l)
+        for line in cert.splitlines():
+            if "Not After : " in line:
+                date = line.split(":", 1)[-1].lstrip()
+                timetuple = datetime.datetime.strptime(date, '%b %d %H:%M:%S %Y %Z').timetuple()
+                validity = time.mktime(timetuple)
+            elif "Subject: UID=" in line:
+                attrs = self.parse_dn(line)
                 uid = attrs['UID']
                 cn = attrs['CN']
         return validity, uid, cn
@@ -112,14 +131,14 @@ class MobileProvision(object):
             pass
         self.certs = []
         self.certs_expired = []
-        for c in pp_dict['DeveloperCertificates']:
-            shasum = hashlib.sha1(c.data).hexdigest()
-            cert = Cert(shasum, self.cert_decoder(c.data))
+        for cert_bin in pp_dict['DeveloperCertificates']:
+            shasum = hashlib.sha1(cert_bin.data).hexdigest()
+            cert = Cert(shasum, self.cert_decoder(cert_bin.data))
             if cert.validity <= time.time():
-                logging.debug("%s: Old certificate found." % (self.uuid))
+                logging.debug('%s: Old certificate found.', self.uuid)
                 self.certs_expired.append(cert)
             else:
-                logging.debug("%s: Up-to-date certificate found." % (self.uuid))
+                logging.debug('%s: Up-to-date certificate found.', self.uuid)
                 self.certs.append(cert)
 
     def pp_loader(self, pp_path):
@@ -128,7 +147,8 @@ class MobileProvision(object):
             start_tag = '<?xml version="1.0" encoding="UTF-8"?>'
             stop_tag = '</plist>'
             start_index = provision_data.index(start_tag)
-            stop_index = provision_data.index(stop_tag, start_index + len(start_tag)) + len(stop_tag)
+            stop_index = provision_data.index(stop_tag,
+                                              start_index + len(start_tag)) + len(stop_tag)
             plist_data = provision_data[start_index:stop_index]
             return plistlib.readPlistFromString(plist_data)
 
@@ -138,7 +158,57 @@ class MobileProvision(object):
             temp.write(cert_string)
             temp.flush()
             command = 'openssl x509 -inform der -text -in %s' % (temp.name)
-            return subprocess.check_output(shlex.split(command)).decode("unicode_escape").encode("latin1")
+            return run_cmd(command)
+
+
+def main(pp_dir, app_id='*', wildcard=False, production=False, keychain=None):
+
+    profiles = []
+    identities = None
+
+    if keychain:
+        identities = get_codesign_identities(keychain)
+
+    for profile in get_profiles(pp_dir):
+
+        if app_id != '*':
+            # Ensure we match the user-specified AppId
+            if app_id != profile.appid:
+                logging.debug('%s: Doesn\'t match specified app_id (%s != %s).',
+                              profile.uuid, app_id, profile.appid)
+                continue
+            # Ensure we match development or distribution parameter
+            if production == profile.development:
+                logging.warning('%s: Doesn\'t match environment (%s).', profile.uuid, "pro")
+                continue
+
+        # Must have at least one valid certificate
+        if not profile.certs:
+            logging.warning('%s: No valid certificates found.', profile.uuid)
+            continue
+
+        # If identities are a thing, try to match those
+        if identities:
+            matches = [cert for cert in profile.certs \
+                      if cert.cn in identities and cert.shasum.upper() in identities.upper()]
+            if matches:
+                profiles.append(profile)
+            else:
+                logging.error('%s: No certificates match the codesigning identities.', profile.uuid)
+        else:
+            profiles.append(profile)
+
+    output = []
+    # Make sure the wildcard provisioning profiles come last
+    for profile in sorted(profiles, key=lambda x: x.appid, reverse=wildcard):
+        for cert in profile.certs:
+            output.append({
+                'uuid': profile.uuid,
+                'name': profile.name,
+                'shasum': cert.shasum,
+                'teamid': profile.teamid,
+            })
+    return output
 
 
 if __name__ == '__main__':
@@ -151,15 +221,20 @@ if __name__ == '__main__':
     parser.add_argument("-a", "--appid", default=None, type=str, \
         help="The application ID to look for.")
     parser.add_argument("-w", "--wildcard", action="store_false", \
-        help="Wether wildcard provisioning profiles should be prioritized when determining the best profile.")
+        help="Heuristic will prefer wildcard provisioning profiles above others.")
     parser.add_argument("-p", "--production", action="store_true", \
         help="Look for development certificates only (as opposed to production certificates).")
     parser.add_argument("-k", "--keychain", type=str, \
-        help="The path of the keychain (must be unlocked prior with 'security unlock-keychain'). Improves the profile matching heuristic.")
-    parser.add_argument("-m", "--mobiledevices", type=str, default=os.path.join(os.path.expanduser('~'), "Library", "MobileDevice", "Provisioning Profiles"), \
+        help="The path of the keychain (must be unlocked).Improves the profile matching heuristic.")
+    parser.add_argument("-m", "--mobiledevices", type=str, \
+                        default=os.path.join(
+                            os.path.expanduser('~'),
+                            "Library", "MobileDevice", "Provisioning Profiles"), \
         help="The directory to look for installed provisioning profiles.")
     parser.add_argument("-r", "--report", action="store_true", \
         help="Generate a nice looking report instead of generating output for an application.")
+    parser.add_argument("-j", "--json", action="store_true", \
+        help="Output in JSON format.")
 
     args = parser.parse_args()
 
@@ -169,55 +244,28 @@ if __name__ == '__main__':
         logging.getLogger().setLevel(logging.DEBUG)
 
 
-    identities = None
     if args.keychain:
         if not os.path.isfile(args.keychain):
             raise SystemExit('Unable find keychain file: %s' % (args.keychain))
-        identities = get_codesign_identities(args.keychain)
 
     if not os.path.isdir(args.mobiledevices):
-        raise SystemExit('Unable to find directory containing provisioning profiles: %s' % (args.mobiledevices))
+        logging.critical('Directory containing provisioning profiles doesn\'t exist.')
+        logging.critical('Directory: %s.', args.mobiledevices)
+        logging.critical('Specify it with -m <provisioning profile directory>.')
+        raise SystemExit
 
-    provisioning_profiles = []
-    for profile in os.listdir(args.mobiledevices):
-        pp_fullpath = os.path.join(args.mobiledevices, profile)
-        if not os.path.isfile(pp_fullpath): continue
-        elif not profile.endswith("mobileprovision"): continue
+    if args.report:
+        [pretty_print(p) for p in get_profiles(args.mobiledevices)]
+        sys.exit(0)
 
-        p = MobileProvision(pp_fullpath)
+    provisioning_profiles = main(args.mobiledevices,
+                                 args.appid,
+                                 args.wildcard,
+                                 args.production,
+                                 args.keychain)
 
-        # When in report mode, just show the info
-        if args.report:
-            pretty_print(p)
-            continue
-
-        if p.appid != '*':
-            if args.appid and args.appid != p.appid:
-                logging.debug("%s: Doesn't match specified appid (%s)" % (p.uuid, p.appid))
-                continue
-
-            if args.production and p.development:
-                logging.warning("%s: Doesn't match environment (%s)" % (p.uuid, "pro"))
-                continue
-            elif not args.production and p.development == False:
-                logging.warning("%s: Doesn't match environment (%s)" % (p.uuid, "dev"))
-                continue
-
-        if not p.certs:
-            logging.warning("%s: No valid certificates found" % (p.uuid))
-            continue
-
-        if identities:
-            for c in p.certs:
-                if c.cn in identities and c.shasum.upper() in identities.upper():
-                    provisioning_profiles.append(p)
-                    break
-                else:
-                    logging.error("%s: Looks good, but no certificates match the codesigning identities available within the keychain." % (p.uuid))
-        else:
-            provisioning_profiles.append(p)
-
-    # Make sure the wildcard provisioning profiles come last
-    for p in sorted(provisioning_profiles, key=lambda x: x.appid, reverse=args.wildcard):
-        for c in p.certs:
-            print '@'.join([p.uuid, p.name, c.shasum, p.teamid])
+    if args.json:
+        print json.dumps(provisioning_profiles)
+    else:
+        for p in provisioning_profiles:
+            print '@'.join([p['uuid'], p['name'], p['shasum'], p['teamid']])
