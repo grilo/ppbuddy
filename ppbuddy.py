@@ -93,7 +93,7 @@ class Cert(object):
 
 class MobileProvision(object):
 
-    def __init__(self, pp_fullpath, cert_decoder):
+    def __init__(self, pp_fullpath):
         pp_dict = self.pp_loader(pp_fullpath)
         self.uuid = pp_dict['UUID']
         self.name = pp_dict['Name']
