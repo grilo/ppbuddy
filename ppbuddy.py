@@ -200,14 +200,15 @@ def main(pp_dir, app_id='*', wildcard=False, production=False, keychain=None):
 
     output = []
     # Make sure the wildcard provisioning profiles come last
-    for profile in sorted(profiles, key=lambda x: x.appid, reverse=wildcard):
+    for profile in sorted(profiles, key=lambda x: x.appid, reverse=wildcard):  
         for cert in profile.certs:
-            output.append({
-                'uuid': profile.uuid,
-                'name': profile.name,
-                'shasum': cert.shasum,
-                'teamid': profile.teamid,
-            })
+            if cert.cn in identities:
+                output.append({
+                    'uuid': profile.uuid,
+                    'name': profile.name,
+                    'shasum': cert.shasum,
+                    'teamid': profile.teamid,
+                })             
     return output
 
 
