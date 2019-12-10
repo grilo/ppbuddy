@@ -81,9 +81,17 @@ def check_expiration(date):
 
 class Cert(object):
 
-    def __init__(self, shasum, cert_string):
+    @staticmethod
+    def decode(cert_bin_data):
+        with tempfile.NamedTemporaryFile() as temp:
+            temp.write(cert_bin_data)
+            temp.flush()
+            command = 'openssl x509 -inform der -text -in %s' % (temp.name)
+            return run_cmd(command)
+
+    def __init__(self, shasum, cert_bin_data):
         self.shasum = shasum.upper()
-        self.validity, self.uid, self.cn = self.parse_cert(cert_string)
+        self.validity, self.uid, self.cn = self.parse_cert(Cert.decode(cert_bin_data))
 
     def parse_cert(self, cert):
         validity, uid, cn = None, None, None
@@ -112,8 +120,20 @@ class Cert(object):
 
 class MobileProvision(object):
 
+    @staticmethod
+    def pp_loader(pp_path):
+        with open(pp_path, 'rb') as provision_file:
+            provision_data = provision_file.read()
+            start_tag = '<?xml version="1.0" encoding="UTF-8"?>'
+            stop_tag = '</plist>'
+            start_index = provision_data.index(start_tag)
+            stop_index = provision_data.index(stop_tag,
+                                              start_index + len(start_tag)) + len(stop_tag)
+            plist_data = provision_data[start_index:stop_index]
+            return plistlib.readPlistFromString(plist_data)
+
     def __init__(self, pp_fullpath):
-        pp_dict = self.pp_loader(pp_fullpath)
+        pp_dict = MobileProvision.pp_loader(pp_fullpath)
         self.uuid = pp_dict['UUID']
         self.name = pp_dict['Name']
         self.teamid = pp_dict['TeamIdentifier'][0]
@@ -133,32 +153,13 @@ class MobileProvision(object):
         self.certs_expired = []
         for cert_bin in pp_dict['DeveloperCertificates']:
             shasum = hashlib.sha1(cert_bin.data).hexdigest()
-            cert = Cert(shasum, self.cert_decoder(cert_bin.data))
+            cert = Cert(shasum, cert_bin.data)
             if cert.validity <= time.time():
                 logging.debug('%s: Old certificate found.', self.uuid)
                 self.certs_expired.append(cert)
             else:
                 logging.debug('%s: Up-to-date certificate found.', self.uuid)
                 self.certs.append(cert)
-
-    def pp_loader(self, pp_path):
-        with open(pp_path, 'rb') as provision_file:
-            provision_data = provision_file.read()
-            start_tag = '<?xml version="1.0" encoding="UTF-8"?>'
-            stop_tag = '</plist>'
-            start_index = provision_data.index(start_tag)
-            stop_index = provision_data.index(stop_tag,
-                                              start_index + len(start_tag)) + len(stop_tag)
-            plist_data = provision_data[start_index:stop_index]
-            return plistlib.readPlistFromString(plist_data)
-
-
-    def cert_decoder(self, cert_string):
-        with tempfile.NamedTemporaryFile() as temp:
-            temp.write(cert_string)
-            temp.flush()
-            command = 'openssl x509 -inform der -text -in %s' % (temp.name)
-            return run_cmd(command)
 
 
 def main(pp_dir, app_id='*', wildcard=False, production=False, keychain=None):
@@ -174,17 +175,17 @@ def main(pp_dir, app_id='*', wildcard=False, production=False, keychain=None):
         if app_id != '*':
             # Ensure we match the user-specified AppId
             if app_id != profile.appid:
-                logging.debug('%s: Doesn\'t match specified app_id (%s != %s).',
+                logging.debug("%s: Doesn't match specified app_id (%s != %s).",
                               profile.uuid, app_id, profile.appid)
                 continue
             # Ensure we match development or distribution parameter
-            if production == profile.development:
-                logging.warning('%s: Doesn\'t match environment (%s).', profile.uuid, "pro")
+            if profile.development == production:
+                logging.debug("%s: Doesn't match environment (%s).", profile.uuid, "pro" if production else "dev")
                 continue
 
         # Must have at least one valid certificate
         if not profile.certs:
-            logging.warning('%s: No valid certificates found.', profile.uuid)
+            logging.debug("%s: No valid certificates found.", profile.uuid)
             continue
 
         # If identities are a thing, try to match those
@@ -194,21 +195,22 @@ def main(pp_dir, app_id='*', wildcard=False, production=False, keychain=None):
             if matches:
                 profiles.append(profile)
             else:
-                logging.error('%s: No certificates match the codesigning identities.', profile.uuid)
+                logging.error("%s: No certificates match the codesigning identities.", profile.uuid)
         else:
             profiles.append(profile)
 
     output = []
     # Make sure the wildcard provisioning profiles come last
-    for profile in sorted(profiles, key=lambda x: x.appid, reverse=wildcard):  
+    for profile in sorted(profiles, key=lambda x: x.appid, reverse=wildcard):
         for cert in profile.certs:
-            if cert.cn in identities:
-                output.append({
-                    'uuid': profile.uuid,
-                    'name': profile.name,
-                    'shasum': cert.shasum,
-                    'teamid': profile.teamid,
-                })             
+            if identities and cert.shasum not in identities:
+                continue
+            output.append({
+                'uuid': profile.uuid,
+                'name': profile.name,
+                'shasum': cert.shasum,
+                'teamid': profile.teamid,
+            })
     return output
 
 
