@@ -258,7 +258,15 @@ if __name__ == '__main__':
         raise SystemExit
 
     if args.report:
-        [pretty_print(p) for p in get_profiles(args.mobiledevices)]
+        pprofiles = get_profiles(args.mobiledevices)
+        if args.appid and args.appid != "*":
+            pprofiles = [p for p in pprofiles if p.appid == args.appid]
+        if args.production:
+            pprofiles = [p for p in pprofiles if not p.development]
+        else:
+            pprofiles = [p for p in pprofiles if p.development]
+
+        [pretty_print(p) for p in pprofiles]
         sys.exit(0)
 
     provisioning_profiles = main(args.mobiledevices,
