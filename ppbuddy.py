@@ -146,7 +146,7 @@ class MobileProvision(object):
         self.development = pp_dict['Entitlements']['get-task-allow']
         self.pushnotifications = False
         try:
-            self.apsenvironment = pp_dict['Entitlements']['aps-environment']
+            self.pushnotifications = pp_dict['Entitlements']['aps-environment']
         except KeyError:
             pass
         self.certs = []
